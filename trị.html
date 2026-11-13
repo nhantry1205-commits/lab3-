@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Giám sát người chạy</title>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f6f9; --card: #ffffff; --text: #1d2430; --muted: #6b7686;
+    --border: #e2e7ee; --accent: #2563eb; --ok: #16a34a; --bad: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #11151c; --card: #1a202a; --text: #e8edf4; --muted: #8a96a8; --border: #2a3342; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  h1 { font-size: 1.3rem; margin: 0; }
+  .status { font-size: .85rem; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--card); }
+  .status.on { color: var(--ok); } .status.off { color: var(--bad); }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); margin-bottom: 12px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .label { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+  .value { font-size: 2.2rem; font-weight: 600; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .unit { font-size: 1rem; color: var(--muted); font-weight: 400; margin-left: 4px; }
+  .alert-box { text-align: center; font-weight: 600; padding: 12px; border-radius: 12px; margin-bottom: 12px;
+               background: color-mix(in srgb, var(--ok) 15%, var(--card)); color: var(--ok); border: 1px solid var(--ok); }
+  .alert-box.warn { background: color-mix(in srgb, var(--bad) 15%, var(--card)); color: var(--bad); border-color: var(--bad); }
+  .charts { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); margin-bottom: 12px; }
+  .chart-box { position: relative; height: 240px; }
+  .controls { display: flex; gap: 12px; flex-wrap: wrap; }
+  button.ctrl { flex: 1 1 180px; padding: 14px; font-size: 1rem; font-weight: 600; border-radius: 10px;
+                border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; }
+  button.ctrl.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.ctrl:disabled { opacity: .5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Giám sát &amp; cảnh báo người chạy</h1>
+    <span id="status" class="status off">Chưa kết nối</span>
+  </header>
+
+  <div id="alertBox" class="alert-box">Bình thường</div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Nhiệt độ</div>
+      <div class="value"><span class="temp-value">--</span><span class="unit">°C</span></div></div>
+    <div class="card"><div class="label">Áp suất khí quyển</div>
+      <div class="value"><span class="pressure-value">--</span><span class="unit">hPa</span></div></div>
+    <div class="card"><div class="label">Độ cao (so với mực nước biển)</div>
+      <div class="value"><span class="altitude-value">--</span><span class="unit">m</span></div></div>
+  </div>
+
+  <div class="charts">
+    <div class="card"><div class="label">Nhiệt độ (°C) - thời gian thực</div>
+      <div class="chart-box"><canvas id="chartTemp"></canvas></div></div>
+    <div class="card"><div class="label">Độ cao (m) - thời gian thực</div>
+      <div class="chart-box"><canvas id="chartAlt"></canvas></div></div>
+  </div>
+
+  <div class="card">
+    <div class="label" style="margin-bottom:10px">Điều khiển thủ công (manual)</div>
+    <div class="controls">
+      <button id="btnLed" class="ctrl btn-led" disabled>Đèn LED: TẮT</button>
+      <button id="btnBuzzer" class="ctrl btn-buzzer" disabled>Loa cảnh báo: TẮT</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ====== CẤU HÌNH (phải trùng với sketch) ======
+  const BROKER_URL = "wss://broker.hivemq.com:8884/mqtt";
+  const PREFIX = "runner/vietdinh/";
+  const T = {
+    temp: PREFIX + "temperature",
+    pressure: PREFIX + "pressure",
+    alt: PREFIX + "altitude",
+    led: PREFIX + "cmd/led",
+    buzzer: PREFIX + "cmd/buzzer"
+  };
+  const TEMP_HIGH = 35, TEMP_LOW = 15, ALT_JUMP = 5, MAX_POINTS = 30;
+
+  const el = {
+    temp: document.querySelector(".temp-value"),
+    pressure: document.querySelector(".pressure-value"),
+    alt: document.querySelector(".altitude-value"),
+    status: document.getElementById("status"),
+    alertBox: document.getElementById("alertBox"),
+    btnLed: document.getElementById("btnLed"),
+    btnBuzzer: document.getElementById("btnBuzzer")
+  };
+
+  // ====== BIỂU ĐỒ ======
+  function makeChart(id, label, color) {
+    return new Chart(document.getElementById(id), {
+      type: "line",
+      data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: color + "33",
+                                       fill: true, tension: .3, pointRadius: 2 }] },
+      options: { responsive: true, maintainAspectRatio: false, animation: false,
+                 plugins: { legend: { display: false } },
+                 scales: { x: { ticks: { maxTicksLimit: 6 } } } }
+    });
+  }
+  const chartTemp = makeChart("chartTemp", "Nhiệt độ", "#ef4444");
+  const chartAlt = makeChart("chartAlt", "Độ cao", "#2563eb");
+
+  function pushPoint(chart, value) {
+    const t = new Date().toLocaleTimeString("vi-VN");
+    chart.data.labels.push(t);
+    chart.data.datasets[0].data.push(value);
+    if (chart.data.labels.length > MAX_POINTS) {
+      chart.data.labels.shift();
+      chart.data.datasets[0].data.shift();
+    }
+    chart.update();
+  }
+
+  // ====== CẢNH BÁO (hiển thị phía web, cùng ngưỡng với ESP32) ======
+  let lastTemp = null, prevAlt = null;
+  function updateAlert() {
+    let msg = "Bình thường";
+    if (lastTemp !== null && lastTemp > TEMP_HIGH) msg = "Cảnh báo: nhiệt độ quá cao!";
+    else if (lastTemp !== null && lastTemp < TEMP_LOW) msg = "Cảnh báo: nhiệt độ quá thấp!";
+    else if (window._altJump) msg = "Cảnh báo: độ cao thay đổi đột ngột!";
+    el.alertBox.textContent = msg;
+    el.alertBox.classList.toggle("warn", msg !== "Bình thường");
+  }
+
+  // ====== MQTT ======
+  const client = mqtt.connect(BROKER_URL, { clientId: "web-runner-" + Math.random().toString(16).slice(2, 8) });
+
+  client.on("connect", () => {
+    el.status.textContent = "Đã kết nối MQTT";
+    el.status.className = "status on";
+    el.btnLed.disabled = el.btnBuzzer.disabled = false;
+    client.subscribe([T.temp, T.pressure, T.alt]);
+  });
+  client.on("close", () => {
+    el.status.textContent = "Mất kết nối";
+    el.status.className = "status off";
+    el.btnLed.disabled = el.btnBuzzer.disabled = true;
+  });
+
+  client.on("message", (topic, payload) => {
+    const v = parseFloat(payload.toString());
+    if (isNaN(v)) return;
+    if (topic === T.temp) {
+      el.temp.textContent = v.toFixed(1);
+      lastTemp = v;
+      pushPoint(chartTemp, v);
+    } else if (topic === T.pressure) {
+      el.pressure.textContent = v.toFixed(1);
+    } else if (topic === T.alt) {
+      el.alt.textContent = v.toFixed(1);
+      window._altJump = prevAlt !== null && Math.abs(v - prevAlt) > ALT_JUMP;
+      prevAlt = v;
+      pushPoint(chartAlt, v);
+    }
+    updateAlert();
+  });
+
+  // ====== NÚT ĐIỀU KHIỂN ======
+  function bindToggle(btn, topic, name) {
+    let on = false;
+    btn.addEventListener("click", () => {
+      on = !on;
+      client.publish(topic, on ? "1" : "0");
+      btn.classList.toggle("active", on);
+      btn.textContent = name + ": " + (on ? "BẬT" : "TẮT");
+    });
+  }
+  bindToggle(el.btnLed, T.led, "Đèn LED");
+  bindToggle(el.btnBuzzer, T.buzzer, "Loa cảnh báo");
+</script>
+</body>
+</html>
